@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config_so101_follower import SO101FollowerConfig
-from .so101_follower import SO101Follower
-from .so101_follower_end_effector import SO101FollowerEndEffector
+from .configuration_stdin_ee import StdinEETeleopConfig
+from .stdin_ee import StdinEETeleop
+
+__all__ = ["StdinEETeleop", "StdinEETeleopConfig"]
