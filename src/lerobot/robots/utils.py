@@ -65,10 +65,6 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from tests.mocks.mock_robot import MockRobot
 
         return MockRobot(config)
-    elif config.type == "so101_follower_end_effector":
-        from .so101_follower.so101_follower_end_effector import SO101FollowerEndEffector
-
-        return SO101FollowerEndEffector(config)
     else:
         raise ValueError(config.type)
 
