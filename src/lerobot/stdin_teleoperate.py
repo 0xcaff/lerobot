@@ -15,6 +15,8 @@ from lerobot.motors import Motor, MotorNormMode, MotorCalibration
 from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
 from lerobot.utils.robot_utils import busy_wait
 
+from scipy.spatial.transform import Rotation as R
+
 
 class StdinLatest:
     def __init__(self):
@@ -65,11 +67,38 @@ class Vector3(TypedDict):
     z: float
 
 
+def v3_to_np(v: Vector3) -> np.ndarray:
+    return np.array([v["x"], v["y"], v["z"]], dtype=float)
+
+
 class Quaternion(TypedDict):
     x: float
     y: float
     z: float
     w: float
+
+
+def quaternion_to_np(q: Quaternion) -> np.ndarray:
+    return np.array(
+        [
+            q["x"],
+            q["y"],
+            q["z"],
+            q["w"],
+        ]
+    )
+
+
+# fixed controller‑to‑robot mapping rotation
+R_MAP = R.from_matrix(
+    np.array(
+        [
+            [0.0, 0.0, -1.0],  # +Xc → −Zr
+            [-1.0, 0.0, 0.0],  # +Yc → −Xr
+            [0.0, 1.0, 0.0],  # +Zc → +Yr
+        ]
+    )
+)
 
 
 class ControllerState(TypedDict):
@@ -169,30 +198,44 @@ def main():
             )
             last_solution = current_joint_pos.copy()
             continue
+        assert session_state is not None and last_solution is not None
 
-        action = np.array(
+        action = R_MAP.apply(
+            v3_to_np(controller["position"])
+            - v3_to_np(session_state.starting_controller["position"])
+        )
+
+        R_start = R.from_quat(
+            quaternion_to_np(session_state.starting_controller["rotation"])
+        )
+        R_now = R.from_quat(quaternion_to_np(controller["rotation"]))
+        delta_R = R_MAP * (R_now * R_start.inv()) * R_MAP.inv()
+
+        T_start_rot = R.from_matrix(
+            session_state.starting_end_effector_position[:3, :3]
+        )
+
+        desired_ee_pos = np.block(
             [
-                -(controller["position"]["z"]
-                 - session_state.starting_controller["position"]["z"]),
-                -(controller["position"]["x"]
-                - session_state.starting_controller["position"]["x"]),
-                (controller["position"]["y"]
-                 - session_state.starting_controller["position"]["y"]),
+                [
+                    (delta_R * T_start_rot).as_matrix(),
+                    (
+                        session_state.starting_end_effector_position[:3, 3] + action[:3]
+                    ).reshape(3, 1),
+                ],
+                [np.zeros((1, 3)), np.ones((1, 1))],
             ]
         )
 
-        desired_ee_pos = np.eye(4)
-        desired_ee_pos[:3, 3] = session_state.starting_end_effector_position[:3, 3] + action[:3]
-
         target_joint_values_in_degrees = kinematics.inverse_kinematics(
-            last_solution, desired_ee_pos, orientation_weight=0.00
+            last_solution, desired_ee_pos, orientation_weight=0.20
         )
 
         last_solution = target_joint_values_in_degrees
-        joint_action = {"gripper": (1 - controller["grip"]) * 50} | {
+        joint_action = {
             key: target_joint_values_in_degrees[i]
             for i, key in enumerate(bus.motors.keys())
-        }
+        } | {"gripper": (1 - controller["grip"]) * 50}
 
         bus.sync_write("Goal_Position", joint_action)
 
