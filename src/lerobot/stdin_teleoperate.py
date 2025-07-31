@@ -36,19 +36,6 @@ class StdinLatest:
 
 
 def loop(fps: float = 60.0) -> Generator[int, None, None]:
-    """
-    Generator that yields an incrementing frame counter at a fixed rate.
-
-    Parameters
-    ----------
-    fps : float, default 60.0
-        Target frames per second.
-
-    Yields
-    ------
-    int
-        Frame index (starts at 0).
-    """
     period = 1.0 / fps
     while True:
         start = time.perf_counter()
@@ -121,48 +108,126 @@ class SessionState:
     starting_controller: ControllerState
 
 
+class Arm:
+    session_state: None | SessionState = None
+    bus: FeetechMotorsBus
+    last_solution: np.ndarray
+
+    def __init__(self, calibration_config_path: str, urdf_path: str, bus_port: str):
+        with open(calibration_config_path) as f, draccus.config_type("json"):
+            calibration = draccus.load(dict[str, MotorCalibration], f)
+
+        self.kinematics = RobotKinematics(
+            urdf_path=urdf_path,
+        )
+
+        bus = FeetechMotorsBus(
+            port=bus_port,
+            motors={
+                "shoulder_pan": Motor(1, "sts3215", MotorNormMode.DEGREES),
+                "shoulder_lift": Motor(2, "sts3215", MotorNormMode.DEGREES),
+                "elbow_flex": Motor(3, "sts3215", MotorNormMode.DEGREES),
+                "wrist_flex": Motor(4, "sts3215", MotorNormMode.DEGREES),
+                "wrist_roll": Motor(5, "sts3215", MotorNormMode.DEGREES),
+                "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
+            },
+            calibration=calibration,
+        )
+
+        bus.connect()
+        bus.write_calibration(calibration)
+
+        with bus.torque_disabled():
+            bus.configure_motors()
+            for motor in bus.motors:
+                bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+                # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
+                bus.write("P_Coefficient", motor, 16)
+                # Set I_Coefficient and D_Coefficient to default value 0 and 32
+                bus.write("I_Coefficient", motor, 0)
+                bus.write("D_Coefficient", motor, 32)
+
+        self.bus = bus
+
+    def update(self, controller: ControllerState, session_id: str):
+        if self.session_state is None or self.session_state.session_id != session_id:
+            current_joint_pos = self.bus.sync_read("Present_Position")
+            current_joint_pos = np.array(
+                [current_joint_pos[name] for name in self.bus.motors]
+            )
+
+            current_ee_position = self.kinematics.forward_kinematics(current_joint_pos)
+
+            self.session_state = SessionState(
+                session_id=session_id,
+                starting_joint_values=current_joint_pos,
+                starting_end_effector_position=current_ee_position,
+                starting_controller=controller,
+            )
+            self.last_solution = current_joint_pos.copy()
+            return
+
+        assert self.session_state is not None and self.last_solution is not None
+
+        action = R_MAP.apply(
+            v3_to_np(controller["position"])
+            - v3_to_np(self.session_state.starting_controller["position"])
+        )
+
+        R_start = R.from_quat(
+            quaternion_to_np(self.session_state.starting_controller["rotation"])
+        )
+        R_now = R.from_quat(quaternion_to_np(controller["rotation"]))
+        delta_R = R_MAP * (R_now * R_start.inv()) * R_MAP.inv()
+
+        T_start_rot = R.from_matrix(
+            self.session_state.starting_end_effector_position[:3, :3]
+        )
+
+        desired_ee_pos = np.block(
+            [
+                [
+                    (delta_R * T_start_rot).as_matrix(),
+                    (
+                        self.session_state.starting_end_effector_position[:3, 3]
+                        + action[:3]
+                    ).reshape(3, 1),
+                ],
+                [np.zeros((1, 3)), np.ones((1, 1))],
+            ]
+        )
+
+        target_joint_values_in_degrees = self.kinematics.inverse_kinematics(
+            self.last_solution, desired_ee_pos, orientation_weight=0.20
+        )
+
+        self.last_solution = target_joint_values_in_degrees
+        joint_action = {
+            key: target_joint_values_in_degrees[i]
+            for i, key in enumerate(self.bus.motors.keys())
+        } | {"gripper": (1 - controller["grip"]) * 50}
+
+        self.bus.sync_write("Goal_Position", joint_action)
+
+
 def main():
-    with open(
-        "/Users/martin/.cache/huggingface/lerobot/calibration/teleoperators/so101_leader/leader_right.json"
-    ) as f, draccus.config_type("json"):
-        calibration = draccus.load(dict[str, MotorCalibration], f)
+    urdf_path = "/Users/martin/projects/SO-ARM100/Simulation/SO101/so101_new_calib.urdf"
+    calibration_config_path_base = "/Users/martin/.cache/huggingface/lerobot/calibration/teleoperators/so101_leader"
 
-    kinematics = RobotKinematics(
-        urdf_path="/Users/martin/projects/SO-ARM100/Simulation/SO101/so101_new_calib.urdf",
-    )
-
-    bus = FeetechMotorsBus(
-        port="/dev/tty.usbmodem5A680095901",
-        motors={
-            "shoulder_pan": Motor(1, "sts3215", MotorNormMode.DEGREES),
-            "shoulder_lift": Motor(2, "sts3215", MotorNormMode.DEGREES),
-            "elbow_flex": Motor(3, "sts3215", MotorNormMode.DEGREES),
-            "wrist_flex": Motor(4, "sts3215", MotorNormMode.DEGREES),
-            "wrist_roll": Motor(5, "sts3215", MotorNormMode.DEGREES),
-            "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-        },
-        calibration=calibration,
-    )
-
-    controller_idx = 0
-
-    bus.connect()
-    bus.write_calibration(calibration)
-
-    with bus.torque_disabled():
-        bus.configure_motors()
-        for motor in bus.motors:
-            bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
-            # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-            bus.write("P_Coefficient", motor, 16)
-            # Set I_Coefficient and D_Coefficient to default value 0 and 32
-            bus.write("I_Coefficient", motor, 0)
-            bus.write("D_Coefficient", motor, 32)
+    arms = [
+        Arm(
+            calibration_config_path=calibration_config_path_base + "/leader_right.json",
+            urdf_path=urdf_path,
+            bus_port="/dev/tty.usbmodem5A680095901",
+        ),
+        Arm(
+            calibration_config_path=calibration_config_path_base + "/leader_left.json",
+            urdf_path=urdf_path,
+            bus_port="/dev/tty.usbmodem5A680120861",
+        ),
+    ]
 
     stdin_reader = StdinLatest()
-
-    session_state: None | SessionState = None
-    last_solution = None
 
     for _ in loop():
         last_line = stdin_reader.get()
@@ -176,68 +241,13 @@ def main():
             continue
 
         controllers = message["controllers"]
-        if len(controllers) < controller_idx + 1:
-            logging.warning("not enough controllers in session")
-            continue
+        for controller_idx, arm in enumerate(arms):
+            if len(controllers) < controller_idx + 1:
+                logging.warning("not enough controllers in session")
+                continue
 
-        controller = controllers[controller_idx]
-
-        if session_state is None or session_state.session_id != message["sessionId"]:
-            current_joint_pos = bus.sync_read("Present_Position")
-            current_joint_pos = np.array(
-                [current_joint_pos[name] for name in bus.motors]
-            )
-
-            current_ee_position = kinematics.forward_kinematics(current_joint_pos)
-
-            session_state = SessionState(
-                session_id=message["sessionId"],
-                starting_joint_values=current_joint_pos,
-                starting_end_effector_position=current_ee_position,
-                starting_controller=controller,
-            )
-            last_solution = current_joint_pos.copy()
-            continue
-        assert session_state is not None and last_solution is not None
-
-        action = R_MAP.apply(
-            v3_to_np(controller["position"])
-            - v3_to_np(session_state.starting_controller["position"])
-        )
-
-        R_start = R.from_quat(
-            quaternion_to_np(session_state.starting_controller["rotation"])
-        )
-        R_now = R.from_quat(quaternion_to_np(controller["rotation"]))
-        delta_R = R_MAP * (R_now * R_start.inv()) * R_MAP.inv()
-
-        T_start_rot = R.from_matrix(
-            session_state.starting_end_effector_position[:3, :3]
-        )
-
-        desired_ee_pos = np.block(
-            [
-                [
-                    (delta_R * T_start_rot).as_matrix(),
-                    (
-                        session_state.starting_end_effector_position[:3, 3] + action[:3]
-                    ).reshape(3, 1),
-                ],
-                [np.zeros((1, 3)), np.ones((1, 1))],
-            ]
-        )
-
-        target_joint_values_in_degrees = kinematics.inverse_kinematics(
-            last_solution, desired_ee_pos, orientation_weight=0.20
-        )
-
-        last_solution = target_joint_values_in_degrees
-        joint_action = {
-            key: target_joint_values_in_degrees[i]
-            for i, key in enumerate(bus.motors.keys())
-        } | {"gripper": (1 - controller["grip"]) * 50}
-
-        bus.sync_write("Goal_Position", joint_action)
+            controller = controllers[controller_idx]
+            arm.update(controller, session_id=message["sessionId"])
 
 
 if __name__ == "__main__":
