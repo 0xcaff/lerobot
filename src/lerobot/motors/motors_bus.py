@@ -712,7 +712,10 @@ class MotorsBus(abc.ABC):
         actual_positions = self.sync_read("Present_Position", motors, normalize=False)
         homing_offsets = self._get_half_turn_homings(actual_positions)
         for motor, offset in homing_offsets.items():
-            self.write("Homing_Offset", motor, offset)
+            try:
+                self.write("Homing_Offset", motor, offset)
+            except Exception as e:
+                raise RuntimeError(f"failed on {motor}") from e
 
         return homing_offsets
 
